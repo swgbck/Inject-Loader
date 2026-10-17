@@ -1,0 +1,13 @@
+(
+echo .vs/
+echo x64/
+echo x86/
+echo Debug/
+echo Release/
+echo **/Debug/
+echo **/Release/
+echo *.user
+echo *.suo
+echo *.VC.db
+echo *.VC.VC.opendb
+) > .gitignore

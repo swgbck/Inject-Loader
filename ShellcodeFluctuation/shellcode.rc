@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_SHELLCODE RCDATA "loader.enc.bin"
